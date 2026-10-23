@@ -41,6 +41,12 @@ def lines_for(d):
             if isinstance(line, dict) and isinstance(line.get("lineId"), str) and isinstance(line.get("text"), str): out.append(line)
     return out
 
+DECISION_VERSION = "authority-provenance-state-v3"
+
+def cache_fingerprint(d):
+    # Versioned keys prevent old keyword-only fallback decisions from being reused.
+    return digest({"decisionVersion": DECISION_VERSION, "dossier": d})
+
 def _model_proposal(d):
     """
     Ask an OpenAI-compatible chat-completions endpoint to classify the dossier.
@@ -180,10 +186,15 @@ def make_proposal(d):
     """Prefer model reasoning; fall back conservatively if unavailable, then validate strictly."""
     try:
         p = _model_proposal(d)
-    except Exception:
+    except Exception as exc:
+        # Log only the exception type/message; never log the API key or request headers.
+        print("AI_PROPOSAL_ERROR", type(exc).__name__, str(exc)[:300], flush=True)
         p = None
     if p is None:
+        print("AI_FALLBACK_USED", str(d.get("dossierId", "?")), flush=True)
         p = safe_fallback(d)
+    else:
+        print("AI_PROPOSAL_OK", str(d.get("dossierId", "?")), flush=True)
     # Always derive identifiers and citations against this exact dossier.
     p["dossierId"] = str(d["dossierId"])
     p["callId"] = "call_" + sha(canon(d))[:40]
@@ -263,7 +274,7 @@ async def endpoint(request: Request):
         try:
             proposals=[]
             for d in ds:
-                fp=digest(d)
+                fp=cache_fingerprint(d)
                 with db() as c: cached=c.execute("SELECT proposal_json FROM proposal_cache WHERE fingerprint=?",(fp,)).fetchone()
                 p=json.loads(cached[0]) if cached else make_proposal(d)
                 p["dossierId"]=d["dossierId"]; p["callId"]="call_"+sha(canon(d))[:40]
@@ -277,7 +288,7 @@ async def endpoint(request: Request):
                     if old["input_digest"]!=inp or old["request_json"]!=canon(b): return err("EVALUATION_CONFLICT","evaluationId reused with changed content",409)
                     return JSONResponse(json.loads(old["proposal_json"]))
                 c.execute("INSERT INTO evaluations(evaluation_id,input_digest,verifier_json,request_json,proposal_json,status,created_at) VALUES(?,?,?,?,?,?,?)",(eid,inp,canon(verifier),canon(b),canon(response),"awaiting_receipts",now()))
-                for d,p in zip(ds,proposals): c.execute("INSERT OR IGNORE INTO proposal_cache VALUES(?,?,?)",(digest(d),canon(p),now()))
+                for d,p in zip(ds,proposals): c.execute("INSERT OR IGNORE INTO proposal_cache VALUES(?,?,?)",(cache_fingerprint(d),canon(p),now()))
             return JSONResponse(response)
         except Exception:
             return err("PROPOSAL_FAILED","Could not safely create proposals",502)
@@ -306,4 +317,6 @@ async def endpoint(request: Request):
             c.execute("UPDATE evaluations SET status='completed',commit_json=?,commit_response_json=? WHERE evaluation_id=? AND status='awaiting_receipts'",(canon(b),canon(result),eid))
             return JSONResponse(result)
     return err("INVALID_OPERATION","operation must be propose or commit")
+
+
 
